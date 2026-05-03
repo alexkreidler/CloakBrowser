@@ -22,9 +22,10 @@ Recording happens at the proxy layer so it works for *any* CDP client
 just Playwright contexts.
 """
 
-from .config import RecordingConfig
+from .config import RecordingConfig, mime_allowed, DEFAULT_BODY_MIME_ALLOW
 from .recorder import CdpJsonlRecorder, HarRecorder, NullRecorder, Recorder, SessionRecorder
 from .har_builder import CdpHarBuilder
+from .body_capture import BodyCapture, BodyCaptureMetrics
 
 __all__ = [
     "RecordingConfig",
@@ -34,4 +35,8 @@ __all__ = [
     "HarRecorder",
     "SessionRecorder",
     "CdpHarBuilder",
+    "BodyCapture",
+    "BodyCaptureMetrics",
+    "mime_allowed",
+    "DEFAULT_BODY_MIME_ALLOW",
 ]

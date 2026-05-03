@@ -48,6 +48,22 @@ class Recorder:
     async def record_binary(self, direction: str, data: bytes) -> None:
         raise NotImplementedError
 
+    async def record_injected_body(
+        self,
+        session_id: str,
+        request_id: str,
+        body: str,
+        base64_encoded: bool,
+        mime: str,
+    ) -> None:
+        """Record a response body actively captured by the proxy.
+
+        Default implementation is a no-op so simple recorders don't need
+        to care.  ``SessionRecorder`` overrides this to fan out into the
+        JSONL transcript and the HAR builder.
+        """
+        return None
+
     async def close(self) -> None:
         return None
 
@@ -62,6 +78,9 @@ class NullRecorder(Recorder):
         return None
 
     async def record_binary(self, direction: str, data: bytes) -> None:
+        return None
+
+    async def record_injected_body(self, *args, **kwargs) -> None:
         return None
 
     async def close(self) -> None:
@@ -226,6 +245,22 @@ class HarRecorder(Recorder):
         # Binary frames carry no Network events.
         return None
 
+    async def set_response_body(
+        self,
+        session_id: str,
+        request_id: str,
+        body: str,
+        base64_encoded: bool,
+    ) -> None:
+        """Inject an actively-captured body directly into the HAR builder."""
+        if self._closed:
+            return
+        async with self._lock:
+            try:
+                self._builder.set_response_body(session_id, request_id, body, base64_encoded)
+            except Exception as exc:  # pragma: no cover
+                logger.debug("HarRecorder.set_response_body failed: %s", exc)
+
     async def close(self) -> None:
         async with self._lock:
             if self._closed:
@@ -326,6 +361,54 @@ class SessionRecorder(Recorder):
     async def record_binary(self, direction: str, data: bytes) -> None:
         for r in self._recorders:
             await r.record_binary(direction, data)
+
+    async def record_injected_body(
+        self,
+        session_id: str,
+        request_id: str,
+        body: str,
+        base64_encoded: bool,
+        mime: str,
+    ) -> None:
+        """Persist a server-injected body capture.
+
+        The body lands in two places:
+
+        1. ``cdp.jsonl`` as a synthetic frame marked ``"injected": true``,
+           shaped like a real ``Network.getResponseBody`` reply so analysis
+           tools that already understand the response shape just work.
+        2. The HAR builder, by calling ``HarRecorder.set_response_body``
+           directly so it doesn't have to reconstruct the request/reply
+           pairing logic.
+        """
+        # 1. Synthesize a JSONL line that mirrors what a real CDP reply would
+        # look like, plus an "injected": true marker and the mime + sessionId
+        # we know about.  We prefix a marker frame so consumers can spot
+        # injected frames cheaply by scanning the start of each line.
+        synthetic = {
+            "ts": time.time(),
+            "label": self.label,
+            "direction": "cdp_to_client",
+            "type": "injected_body",
+            "injected": True,
+            "session_id": session_id,
+            "request_id": request_id,
+            "mime": mime,
+            "base64_encoded": base64_encoded,
+            "body": body,
+        }
+        line = json.dumps(synthetic, ensure_ascii=False, separators=(",", ":")) + "\n"
+        for r in self._recorders:
+            # Reuse the JSONL writer's lock by going through record_text on
+            # the JSONL recorder; for HarRecorder, hand the body straight in.
+            if isinstance(r, CdpJsonlRecorder):
+                async with r._lock:
+                    await r._write_line(synthetic)
+            elif isinstance(r, HarRecorder):
+                await r.set_response_body(session_id, request_id, body, base64_encoded)
+            else:
+                # Generic fan-out — let custom recorders subscribe.
+                await r.record_injected_body(session_id, request_id, body, base64_encoded, mime)
 
     async def close(self) -> None:
         for r in self._recorders:

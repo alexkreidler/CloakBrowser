@@ -148,6 +148,29 @@ class CdpHarBuilder:
         if "id" in msg and "method" in msg:
             self._handle_command(session_id, msg["id"], msg["method"], msg.get("params") or {})
 
+    def set_response_body(
+        self,
+        session_id: str,
+        request_id: str,
+        body: str,
+        base64_encoded: bool,
+    ) -> None:
+        """Attach a captured response body directly to a request state.
+
+        Used by the active body-capture path in cloakserve, which has
+        already paired a ``Network.getResponseBody`` reply with its
+        original request and just needs to drop the body into the HAR.
+        Falls back silently if we never saw the request (e.g. the body
+        came from a redirect that was already finalized).
+        """
+        state = self._requests.get((session_id, request_id))
+        if state is None:
+            return
+        if base64_encoded:
+            state.body_b64 = body
+        else:
+            state.body_text = body
+
     # ---- command bookkeeping (for body capture) ---------------------------
 
     def _handle_command(self, session_id: str, msg_id: int, method: str, params: dict) -> None:

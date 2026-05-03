@@ -50,7 +50,7 @@ from aiohttp import web
 
 from cloakbrowser.browser import build_args, maybe_resolve_geoip, _resolve_webrtc_args, _normalize_socks_string_url
 from cloakbrowser.download import ensure_binary
-from cloakbrowser.recording import RecordingConfig, SessionRecorder
+from cloakbrowser.recording import BodyCapture, RecordingConfig, SessionRecorder
 from cloakbrowser.recording.config import parse_bool_flag
 
 logging.basicConfig(
@@ -393,6 +393,9 @@ async def handle_root(request: web.Request) -> web.Response:
             "record_dir": str(recording.record_dir) if recording.record_dir else None,
             "record_cdp": recording.record_cdp,
             "record_har": recording.record_har,
+            "record_bodies": recording.record_bodies,
+            "max_body_bytes": recording.max_body_bytes,
+            "max_total_body_bytes": recording.max_total_body_bytes,
         },
     })
 
@@ -490,14 +493,44 @@ async def proxy_cdp_websocket(
     target_url: str,
     label: str,
     recorder: SessionRecorder | None = None,
+    body_capture: BodyCapture | None = None,
 ) -> None:
     """Bidirectional WebSocket proxy between client and Chrome CDP.
 
     If ``recorder`` is provided, every frame in either direction is fed into
     it before being forwarded.  Recording errors are swallowed — they must
     never break the proxy path.
+
+    If ``body_capture`` is provided AND active, cloakserve will inject its
+    own ``Network.getResponseBody`` commands toward Chrome after each
+    ``Network.loadingFinished`` event whose MIME passes the configured
+    allow-list, intercept the replies (so the upstream client never sees
+    them), and feed bodies back into the recorder.
     """
     rec = recorder  # local alias; ``None`` means no recording
+    bc = body_capture if (body_capture and body_capture.enabled) else None
+
+    # Lock around cdp_ws.send() so the body-capture injection path can't
+    # interleave with the client_to_cdp forwarder.
+    cdp_send_lock = asyncio.Lock()
+
+    async def _send_to_chrome(payload: str) -> None:
+        async with cdp_send_lock:
+            await cdp_ws.send(payload)
+
+    async def _record_injected_command(payload: str) -> None:
+        """Mirror an injected command into the JSONL transcript so the
+        record stays a complete record of what flowed to Chrome.
+        Tagged with ``"injected": true`` via the synthetic frame
+        SessionRecorder writes; here we simply emit the raw JSON so
+        the existing ``client_to_cdp`` direction stays valid."""
+        if rec is None:
+            return
+        try:
+            await rec.record_text("client_to_cdp", payload)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("%s record injected cmd: %s", label, exc)
+
     try:
         async with websockets.connect(
             target_url, max_size=None, ping_interval=None, ping_timeout=None,
@@ -513,14 +546,15 @@ async def proxy_cdp_websocket(
                                     await rec.record_text("client_to_cdp", msg.data)
                                 except Exception as exc:  # pragma: no cover
                                     logger.debug("%s record c->cdp: %s", label, exc)
-                            await cdp_ws.send(msg.data)
+                            await _send_to_chrome(msg.data)
                         elif msg.type == aiohttp.WSMsgType.BINARY:
                             if rec is not None:
                                 try:
                                     await rec.record_binary("client_to_cdp", msg.data)
                                 except Exception as exc:  # pragma: no cover
                                     logger.debug("%s record c->cdp bin: %s", label, exc)
-                            await cdp_ws.send(msg.data)
+                            async with cdp_send_lock:
+                                await cdp_ws.send(msg.data)
                         elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
                             break
                 except Exception as exc:
@@ -530,12 +564,60 @@ async def proxy_cdp_websocket(
                 try:
                     async for msg in cdp_ws:
                         if isinstance(msg, str):
+                            # 1. record the raw frame as it actually flowed
+                            #    from Chrome (whether or not we end up
+                            #    forwarding it).
                             if rec is not None:
                                 try:
                                     await rec.record_text("cdp_to_client", msg)
                                 except Exception as exc:  # pragma: no cover
                                     logger.debug("%s record cdp->c: %s", label, exc)
-                            await client_ws.send_str(msg)
+
+                            # 2. body-capture decision: parse + dispatch.
+                            forward_to_client = True
+                            injected_cmds: list[dict] = []
+                            captured_body = None
+                            if bc is not None:
+                                try:
+                                    parsed = json.loads(msg)
+                                except (ValueError, TypeError):
+                                    parsed = None
+                                if isinstance(parsed, dict):
+                                    if bc.is_injected_id(parsed.get("id")):
+                                        # Reply to one of OUR injected
+                                        # commands — consume it.
+                                        was_ours, captured_body = bc.intercept_reply(parsed)
+                                        if was_ours:
+                                            forward_to_client = False
+                                    else:
+                                        # Possibly an event we should react
+                                        # to (e.g. loadingFinished).
+                                        injected_cmds = bc.feed_event(parsed)
+
+                            if forward_to_client:
+                                await client_ws.send_str(msg)
+
+                            # 3. persist any captured body.
+                            if captured_body is not None and rec is not None:
+                                try:
+                                    await rec.record_injected_body(
+                                        session_id=captured_body.session_id,
+                                        request_id=captured_body.request_id,
+                                        body=captured_body.body,
+                                        base64_encoded=captured_body.base64_encoded,
+                                        mime=captured_body.mime,
+                                    )
+                                except Exception as exc:  # pragma: no cover
+                                    logger.debug("%s record body: %s", label, exc)
+
+                            # 4. send any injected commands toward Chrome.
+                            for cmd in injected_cmds:
+                                payload = json.dumps(cmd, separators=(",", ":"))
+                                await _record_injected_command(payload)
+                                try:
+                                    await _send_to_chrome(payload)
+                                except Exception as exc:
+                                    logger.debug("%s injected send: %s", label, exc)
                         else:
                             if rec is not None:
                                 try:
@@ -553,6 +635,9 @@ async def proxy_cdp_websocket(
             )
             for task in pending:
                 task.cancel()
+
+            if bc is not None:
+                logger.info("%s: body capture stats %s", label, bc.stats())
             logger.info("%s: disconnected", label)
 
     except Exception as exc:
@@ -592,9 +677,10 @@ async def handle_ws_default(request: web.Request) -> web.WebSocketResponse:
             "client_ip": request.remote,
         },
     )
+    body_capture = BodyCapture(rec_config) if rec_config.bodies_enabled else None
     try:
         target_url = f"ws://127.0.0.1:{cp.cdp_port}/devtools/{path}"
-        await proxy_cdp_websocket(ws, target_url, label, recorder=recorder)
+        await proxy_cdp_websocket(ws, target_url, label, recorder=recorder, body_capture=body_capture)
     finally:
         pool.disconnect("__default__")
     return ws
@@ -628,9 +714,10 @@ async def handle_ws_seed(request: web.Request) -> web.WebSocketResponse:
             "client_ip": request.remote,
         },
     )
+    body_capture = BodyCapture(rec_config) if rec_config.bodies_enabled else None
     try:
         target_url = f"ws://127.0.0.1:{cp.cdp_port}/devtools/{path}"
-        await proxy_cdp_websocket(ws, target_url, label, recorder=recorder)
+        await proxy_cdp_websocket(ws, target_url, label, recorder=recorder, body_capture=body_capture)
     finally:
         pool.disconnect(seed)
     return ws
@@ -664,6 +751,14 @@ def parse_cli_args(argv: list[str]) -> tuple[dict, list[str]]:
         --record-cdp=BOOL      Write raw cdp.jsonl transcript (default: true).
         --record-har=BOOL      Write derived network.har (default: false).
         --record-max-bytes=N   Soft cap on cdp.jsonl bytes (default: unlimited).
+        --record-bodies=BOOL   Actively capture response bodies (default: false).
+                               Issues Network.getResponseBody after each
+                               loadingFinished event for MIME types in the
+                               built-in allow-list (text/*, JSON, JS, CSS,
+                               XML, SVG). Skipped: images, fonts, video,
+                               wasm, octet-stream.
+        --record-body-max=N    Per-body byte cap (default: 2 MiB).
+        --record-body-total=N  Per-session total body byte cap (default: 100 MiB).
     """
     config: dict = {
         "port": 9222,
@@ -676,6 +771,9 @@ def parse_cli_args(argv: list[str]) -> tuple[dict, list[str]]:
         "record_cdp": True,
         "record_har": False,
         "record_max_bytes": None,
+        "record_bodies": False,
+        "record_body_max": None,
+        "record_body_total": None,
     }
     passthrough = []
     # Flags consumed by cloakserve (not passed to Chrome)
@@ -708,6 +806,18 @@ def parse_cli_args(argv: list[str]) -> tuple[dict, list[str]]:
                 config["record_max_bytes"] = int(arg.split("=", 1)[1])
             except ValueError:
                 logger.warning("Invalid --record-max-bytes value, ignoring: %s", arg)
+        elif arg.startswith("--record-bodies="):
+            config["record_bodies"] = parse_bool_flag(arg.split("=", 1)[1])
+        elif arg.startswith("--record-body-max="):
+            try:
+                config["record_body_max"] = int(arg.split("=", 1)[1])
+            except ValueError:
+                logger.warning("Invalid --record-body-max value, ignoring: %s", arg)
+        elif arg.startswith("--record-body-total="):
+            try:
+                config["record_body_total"] = int(arg.split("=", 1)[1])
+            except ValueError:
+                logger.warning("Invalid --record-body-total value, ignoring: %s", arg)
         # Route through build_args() so companion flags are set correctly
         elif arg.startswith("--fingerprint-locale="):
             config["default_locale"] = arg.split("=", 1)[1]
@@ -746,7 +856,10 @@ def main() -> None:
         record_dir=config["record_dir"],
         record_cdp=config["record_cdp"],
         record_har=config["record_har"],
+        record_bodies=config["record_bodies"],
         max_jsonl_bytes=config["record_max_bytes"],
+        max_body_bytes=config["record_body_max"],
+        max_total_body_bytes=config["record_body_total"],
     )
 
     app = web.Application()
@@ -779,11 +892,18 @@ def main() -> None:
     )
     if recording.enabled:
         logger.info(
-            "Recording enabled: dir=%s cdp=%s har=%s",
+            "Recording enabled: dir=%s cdp=%s har=%s bodies=%s",
             recording.record_dir,
             recording.record_cdp,
             recording.record_har,
+            recording.record_bodies,
         )
+        if recording.record_bodies:
+            logger.info(
+                "  body capture limits: per-body=%d bytes, per-session=%s bytes",
+                recording.max_body_bytes,
+                recording.max_total_body_bytes if recording.max_total_body_bytes else "unlimited",
+            )
 
     web.run_app(app, host="0.0.0.0", port=port, print=None)
 

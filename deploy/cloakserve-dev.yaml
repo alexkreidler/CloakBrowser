@@ -1,0 +1,91 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloakserve-dev
+  namespace: cloakbrowser
+  labels:
+    app: cloakserve-dev
+spec:
+  type: ClusterIP
+  selector:
+    app: cloakserve-dev
+  ports:
+    - name: cdp
+      port: 9222
+      targetPort: 9222
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloakserve-dev
+  namespace: cloakbrowser
+  labels:
+    app: cloakserve-dev
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cloakserve-dev
+  template:
+    metadata:
+      labels:
+        app: cloakserve-dev
+    spec:
+      imagePullSecrets:
+        - name: ghcr-alexkreidler
+      containers:
+        - name: cloakserve
+          image: ghcr.io/alexkreidler/cloakbrowser:dev
+          imagePullPolicy: Always
+          # Override the entrypoint to start Xvfb (so any headed bits work)
+          # then run cloakserve with recording on. --headless=true is the
+          # default, so Chrome stays headless even with Xvfb running.
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+              export DISPLAY=:99
+              sleep 1
+              mkdir -p /recordings
+              exec cloakserve \
+                --port=9222 \
+                --record-dir=/recordings \
+                --record-cdp=true \
+                --record-har=true \
+                --no-sandbox
+          ports:
+            - name: cdp
+              containerPort: 9222
+              protocol: TCP
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 9222
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 9222
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          volumeMounts:
+            - name: recordings
+              mountPath: /recordings
+      volumes:
+        - name: recordings
+          emptyDir: {}

@@ -166,6 +166,9 @@ async def run() -> int:
         f"--record-dir={RECORD_DIR}",
         "--record-cdp=true",
         "--record-har=true",
+        "--record-bodies=true",
+        "--record-body-max=1048576",     # 1 MiB per body for the e2e
+        "--record-body-total=10485760",  # 10 MiB session cap
         "--no-sandbox",  # passed through to Chromium; required when running as root
     ]
     print(f"[e2e] starting: {' '.join(cmd)}", flush=True)
@@ -272,6 +275,45 @@ async def run() -> int:
                     f"{entry['request']['url']} -> {entry['response']['status']}",
                     flush=True,
                 )
+                # New: body capture assertion.
+                content = (entry.get("response") or {}).get("content") or {}
+                body = content.get("text")
+                if body and "<" in body and ">" in body:
+                    print(
+                        f"[e2e] OK HAR entry has captured body "
+                        f"({len(body)} chars, mime={content.get('mimeType')})",
+                        flush=True,
+                    )
+                else:
+                    failures.append(
+                        f"network.har: expected captured HTML body for {host}, "
+                        f"got {len(body or '')} chars"
+                    )
+
+        # New: scan cdp.jsonl for the injected_body marker.
+        if cdp_path.exists():
+            host = TARGET_URL.split("//", 1)[1].split("/", 1)[0]
+            injected_lines = [
+                line for line in cdp_path.read_text().splitlines()
+                if '"injected":true' in line or '"injected": true' in line
+            ]
+            print(f"[e2e] injected_body frames in cdp.jsonl: {len(injected_lines)}", flush=True)
+            if injected_lines:
+                # Look for one whose body contains text we'd expect from example.com.
+                for line in injected_lines:
+                    rec = json.loads(line)
+                    body = rec.get("body") or ""
+                    if "Example Domain" in body or "<html" in body.lower():
+                        print(
+                            f"[e2e] OK cdp.jsonl has injected body for "
+                            f"{rec.get('mime')} ({len(body)} chars)",
+                            flush=True,
+                        )
+                        break
+                else:
+                    failures.append("cdp.jsonl: no injected_body looked like HTML")
+            else:
+                failures.append("cdp.jsonl: zero injected_body frames")
 
         if failures:
             print("[e2e] FAILED:", flush=True)
