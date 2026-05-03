@@ -29,6 +29,48 @@ logger = logging.getLogger("cloakbrowser")
 _VIEWPORT_UNSET = object()
 
 
+# ---------------------------------------------------------------------------
+# Playwright HAR convenience helpers (network recording at the context layer)
+# ---------------------------------------------------------------------------
+
+HarMode = Literal["full", "minimal"]
+HarContent = Literal["embed", "attach", "omit"]
+
+
+def _resolve_har_kwargs(
+    har_path: str | os.PathLike | None,
+    har_mode: HarMode | None,
+    har_content: HarContent | None,
+    har_url_filter: str | None,
+    har_omit_content: bool | None,
+) -> dict[str, Any]:
+    """Map cloakbrowser HAR options to Playwright ``record_har_*`` kwargs.
+
+    Returns an empty dict when ``har_path`` is not set.  Only forwards options
+    that the user actually provided so we don't override Playwright defaults.
+
+    Notes:
+        * ``har_path`` extension determines compression: ``.har`` -> JSON,
+          ``.zip`` -> archived (HAR + separate body files).
+        * ``har_content="embed"`` (default in Playwright) inlines bodies as
+          base64 in the HAR — convenient but bigger files.
+        * ``har_omit_content`` is the legacy boolean Playwright still accepts;
+          equivalent to ``har_content="omit"``.
+    """
+    if har_path is None:
+        return {}
+    out: dict[str, Any] = {"record_har_path": os.fspath(har_path)}
+    if har_mode is not None:
+        out["record_har_mode"] = har_mode
+    if har_content is not None:
+        out["record_har_content"] = har_content
+    if har_url_filter is not None:
+        out["record_har_url_filter"] = har_url_filter
+    if har_omit_content is not None:
+        out["record_har_omit_content"] = har_omit_content
+    return out
+
+
 def _resolve_timezone(timezone: str | None, kwargs: dict[str, Any]) -> str | None:
     """Accept both timezone and timezone_id — either works, no warning."""
     if "timezone_id" in kwargs:
@@ -252,6 +294,11 @@ def launch_persistent_context(
     humanize: bool = False,
     human_preset: HumanPreset = "default",
     human_config: HumanConfigOverrides | None = None,
+    har_path: str | os.PathLike | None = None,
+    har_mode: HarMode | None = None,
+    har_content: HarContent | None = None,
+    har_url_filter: str | None = None,
+    har_omit_content: bool | None = None,
     **kwargs: Any,
 ) -> Any:
     """Launch stealth browser with a persistent profile and return a BrowserContext.
@@ -281,6 +328,13 @@ def launch_persistent_context(
         humanize: Enable human-like mouse, keyboard, scroll behavior (default False).
         human_preset: Humanize preset — 'default' or 'careful' (default 'default').
         human_config: Custom humanize config mapping to override preset values.
+        har_path: Output path for a network HAR (.har or .zip). Setting this
+            enables Playwright's built-in HAR recording for the context. The
+            HAR is written when ``ctx.close()`` is called.
+        har_mode: ``"full"`` or ``"minimal"``.
+        har_content: ``"embed"``, ``"attach"`` or ``"omit"``.
+        har_url_filter: Glob/regex string limiting which URLs to record.
+        har_omit_content: Legacy boolean shorthand for ``har_content="omit"``.
         **kwargs: Passed directly to playwright.chromium.launch_persistent_context().
 
     Returns:
@@ -326,6 +380,9 @@ def launch_persistent_context(
         context_kwargs["viewport"] = viewport
     if color_scheme:
         context_kwargs["color_scheme"] = color_scheme
+    context_kwargs.update(
+        _resolve_har_kwargs(har_path, har_mode, har_content, har_url_filter, har_omit_content)
+    )
     context_kwargs.update(kwargs)
 
     pw = sync_playwright().start()
@@ -376,6 +433,11 @@ async def launch_persistent_context_async(
     humanize: bool = False,
     human_preset: HumanPreset = "default",
     human_config: HumanConfigOverrides | None = None,
+    har_path: str | os.PathLike | None = None,
+    har_mode: HarMode | None = None,
+    har_content: HarContent | None = None,
+    har_url_filter: str | None = None,
+    har_omit_content: bool | None = None,
     **kwargs: Any,
 ) -> Any:
     """Async version of launch_persistent_context().
@@ -402,6 +464,13 @@ async def launch_persistent_context_async(
         humanize: Enable human-like mouse, keyboard, scroll behavior (default False).
         human_preset: Humanize preset — 'default' or 'careful' (default 'default').
         human_config: Custom humanize config mapping to override preset values.
+        har_path: Output path for a network HAR (.har or .zip). Setting this
+            enables Playwright's built-in HAR recording for the context. The
+            HAR is written when ``ctx.close()`` is called.
+        har_mode: ``"full"`` or ``"minimal"``.
+        har_content: ``"embed"``, ``"attach"`` or ``"omit"``.
+        har_url_filter: Glob/regex string limiting which URLs to record.
+        har_omit_content: Legacy boolean shorthand for ``har_content="omit"``.
         **kwargs: Passed directly to playwright.chromium.launch_persistent_context().
 
     Returns:
@@ -452,6 +521,9 @@ async def launch_persistent_context_async(
         context_kwargs["viewport"] = viewport
     if color_scheme:
         context_kwargs["color_scheme"] = color_scheme
+    context_kwargs.update(
+        _resolve_har_kwargs(har_path, har_mode, har_content, har_url_filter, har_omit_content)
+    )
     context_kwargs.update(kwargs)
 
     pw = await async_playwright().start()
@@ -501,6 +573,11 @@ def launch_context(
     humanize: bool = False,
     human_preset: HumanPreset = "default",
     human_config: HumanConfigOverrides | None = None,
+    har_path: str | os.PathLike | None = None,
+    har_mode: HarMode | None = None,
+    har_content: HarContent | None = None,
+    har_url_filter: str | None = None,
+    har_omit_content: bool | None = None,
     **kwargs: Any,
 ) -> Any:
     """Launch stealth browser and return a BrowserContext with common options pre-set.
@@ -525,6 +602,17 @@ def launch_context(
         humanize: Enable human-like mouse, keyboard, scroll behavior (default False).
         human_preset: Humanize preset — 'default' or 'careful' (default 'default').
         human_config: Custom humanize config mapping to override preset values.
+        har_path: Output path for a network HAR. Extension decides format:
+            ``.har`` (plain JSON) or ``.zip`` (HAR + body files). Setting this
+            enables Playwright's built-in HAR recording for the context. The
+            HAR is written when ``ctx.close()`` is called.
+        har_mode: ``"full"`` (default Playwright behavior) or ``"minimal"``
+            — minimal mode skips fields not needed for replay via ``routeFromHAR``.
+        har_content: ``"embed"`` (inline bodies, base64), ``"attach"`` (separate
+            files inside ``.zip``), or ``"omit"`` (no bodies).
+        har_url_filter: Glob/regex string limiting which URLs to record.
+        har_omit_content: Legacy boolean; ``True`` is equivalent to
+            ``har_content="omit"``.
         **kwargs: Passed to browser.new_context().
 
     Returns:
@@ -556,6 +644,9 @@ def launch_context(
         context_kwargs["viewport"] = viewport
     if color_scheme:
         context_kwargs["color_scheme"] = color_scheme
+    context_kwargs.update(
+        _resolve_har_kwargs(har_path, har_mode, har_content, har_url_filter, har_omit_content)
+    )
     context_kwargs.update(kwargs)
 
     try:
@@ -600,6 +691,11 @@ async def launch_context_async(
     humanize: bool = False,
     human_preset: HumanPreset = "default",
     human_config: HumanConfigOverrides | None = None,
+    har_path: str | os.PathLike | None = None,
+    har_mode: HarMode | None = None,
+    har_content: HarContent | None = None,
+    har_url_filter: str | None = None,
+    har_omit_content: bool | None = None,
     **kwargs: Any,
 ) -> Any:
     """Async version of launch_context().
@@ -625,6 +721,13 @@ async def launch_context_async(
         humanize: Enable human-like mouse, keyboard, scroll behavior (default False).
         human_preset: Humanize preset — 'default' or 'careful' (default 'default').
         human_config: Custom humanize config mapping to override preset values.
+        har_path: Output path for a network HAR (.har or .zip). See
+            ``launch_context()`` for details. The HAR is written when
+            ``await ctx.close()`` is called.
+        har_mode: ``"full"`` or ``"minimal"``.
+        har_content: ``"embed"``, ``"attach"`` or ``"omit"``.
+        har_url_filter: Glob/regex string limiting which URLs to record.
+        har_omit_content: Legacy boolean shorthand for ``har_content="omit"``.
         **kwargs: Passed to browser.new_context() — e.g. storage_state, permissions.
 
     Returns:
@@ -674,6 +777,9 @@ async def launch_context_async(
         context_kwargs["viewport"] = viewport
     if color_scheme:
         context_kwargs["color_scheme"] = color_scheme
+    context_kwargs.update(
+        _resolve_har_kwargs(har_path, har_mode, har_content, har_url_filter, har_omit_content)
+    )
     context_kwargs.update(kwargs)
 
     # Catch BaseException (not just Exception) so that asyncio.CancelledError

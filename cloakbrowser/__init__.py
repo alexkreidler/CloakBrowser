@@ -26,6 +26,11 @@ def __getattr__(name):
         from .human.config import resolve_config
         globals()["resolve_human_config"] = resolve_config
         return resolve_config
+    if name in ("RecordingConfig", "CdpHarBuilder"):
+        from .recording import RecordingConfig, CdpHarBuilder
+        globals()["RecordingConfig"] = RecordingConfig
+        globals()["CdpHarBuilder"] = CdpHarBuilder
+        return globals()[name]
     raise AttributeError(f"module 'cloakbrowser' has no attribute {name}")
 
 __all__ = [
@@ -46,6 +51,8 @@ __all__ = [
     "ProxySettings",
     "HumanConfig",
     "resolve_human_config",
+    "RecordingConfig",
+    "CdpHarBuilder",
     "__version__",
 ]
 

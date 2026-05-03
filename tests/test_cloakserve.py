@@ -124,6 +124,35 @@ class TestParseCliArgs:
         _, passthrough = parse_cli_args(["--data-dir=/tmp/test"])
         assert not any(a.startswith("--data-dir=") for a in passthrough)
 
+    def test_recording_defaults(self):
+        config, _ = parse_cli_args([])
+        assert config["record_dir"] is None
+        assert config["record_cdp"] is True
+        assert config["record_har"] is False
+        assert config["record_max_bytes"] is None
+
+    def test_record_dir_consumed(self):
+        config, passthrough = parse_cli_args(["--record-dir=/var/rec", "--no-sandbox"])
+        assert config["record_dir"] == "/var/rec"
+        assert "--record-dir=/var/rec" not in passthrough
+        assert "--no-sandbox" in passthrough
+
+    def test_record_har_flag(self):
+        config, _ = parse_cli_args(["--record-dir=/r", "--record-har=true"])
+        assert config["record_har"] is True
+
+    def test_record_cdp_disable(self):
+        config, _ = parse_cli_args(["--record-dir=/r", "--record-cdp=false"])
+        assert config["record_cdp"] is False
+
+    def test_record_max_bytes(self):
+        config, _ = parse_cli_args(["--record-max-bytes=1048576"])
+        assert config["record_max_bytes"] == 1048576
+
+    def test_record_max_bytes_invalid_ignored(self):
+        config, _ = parse_cli_args(["--record-max-bytes=notanumber"])
+        assert config["record_max_bytes"] is None
+
     @patch("os.path.exists", return_value=True)
     def test_default_data_dir_docker(self, _mock):
         assert _default_data_dir() == "/tmp/cloakserve"

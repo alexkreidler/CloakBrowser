@@ -7,12 +7,24 @@ connections through a single port. Each seed gets its own browser identity.
 Usage:
     cloakserve                                      # default, backward compat
     cloakserve --port=9222                           # custom port
+    cloakserve --port=9222 --record-dir=./recordings --record-har=true
 
 Client:
     browser = pw.chromium.connect_over_cdp("http://host:9222?fingerprint=12345")
     browser = pw.chromium.connect_over_cdp(
         "http://host:9222?fingerprint=12345&timezone=America/New_York&locale=en-US"
     )
+
+Recording:
+    --record-dir=PATH      Enable recording. One folder per WebSocket session.
+    --record-cdp=BOOL      Write raw cdp.jsonl transcript (default: true).
+    --record-har=BOOL      Write derived network.har (default: false).
+    --record-max-bytes=N   Soft cap on cdp.jsonl size (default: unlimited).
+
+    Each session folder contains:
+        cdp.jsonl       every CDP frame, one JSON per line
+        network.har     HAR 1.2 derived from Network.* events (if --record-har)
+        metadata.json   seed/pid/port/proxy/locale/started_at
 """
 
 from __future__ import annotations
@@ -38,6 +50,8 @@ from aiohttp import web
 
 from cloakbrowser.browser import build_args, maybe_resolve_geoip, _resolve_webrtc_args, _normalize_socks_string_url
 from cloakbrowser.download import ensure_binary
+from cloakbrowser.recording import RecordingConfig, SessionRecorder
+from cloakbrowser.recording.config import parse_bool_flag
 
 logging.basicConfig(
     level=logging.INFO,
@@ -357,6 +371,7 @@ def _ws_scheme(request: web.Request) -> str:
 async def handle_root(request: web.Request) -> web.Response:
     """Health check / process status."""
     pool: ChromePool = request.app["pool"]
+    recording: RecordingConfig = request.app["recording"]
     processes = {}
     for key, proc in pool._processes.items():
         if proc.process.poll() is None:
@@ -373,6 +388,12 @@ async def handle_root(request: web.Request) -> web.Response:
         "status": "ok",
         "active": len(processes),
         "processes": processes,
+        "recording": {
+            "enabled": recording.enabled,
+            "record_dir": str(recording.record_dir) if recording.record_dir else None,
+            "record_cdp": recording.record_cdp,
+            "record_har": recording.record_har,
+        },
     })
 
 
@@ -468,8 +489,15 @@ async def proxy_cdp_websocket(
     client_ws: web.WebSocketResponse,
     target_url: str,
     label: str,
+    recorder: SessionRecorder | None = None,
 ) -> None:
-    """Bidirectional WebSocket proxy between client and Chrome CDP."""
+    """Bidirectional WebSocket proxy between client and Chrome CDP.
+
+    If ``recorder`` is provided, every frame in either direction is fed into
+    it before being forwarded.  Recording errors are swallowed — they must
+    never break the proxy path.
+    """
+    rec = recorder  # local alias; ``None`` means no recording
     try:
         async with websockets.connect(
             target_url, max_size=None, ping_interval=None, ping_timeout=None,
@@ -480,8 +508,18 @@ async def proxy_cdp_websocket(
                 try:
                     async for msg in client_ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
+                            if rec is not None:
+                                try:
+                                    await rec.record_text("client_to_cdp", msg.data)
+                                except Exception as exc:  # pragma: no cover
+                                    logger.debug("%s record c->cdp: %s", label, exc)
                             await cdp_ws.send(msg.data)
                         elif msg.type == aiohttp.WSMsgType.BINARY:
+                            if rec is not None:
+                                try:
+                                    await rec.record_binary("client_to_cdp", msg.data)
+                                except Exception as exc:  # pragma: no cover
+                                    logger.debug("%s record c->cdp bin: %s", label, exc)
                             await cdp_ws.send(msg.data)
                         elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
                             break
@@ -492,8 +530,18 @@ async def proxy_cdp_websocket(
                 try:
                     async for msg in cdp_ws:
                         if isinstance(msg, str):
+                            if rec is not None:
+                                try:
+                                    await rec.record_text("cdp_to_client", msg)
+                                except Exception as exc:  # pragma: no cover
+                                    logger.debug("%s record cdp->c: %s", label, exc)
                             await client_ws.send_str(msg)
                         else:
+                            if rec is not None:
+                                try:
+                                    await rec.record_binary("cdp_to_client", msg)
+                                except Exception as exc:  # pragma: no cover
+                                    logger.debug("%s record cdp->c bin: %s", label, exc)
                             await client_ws.send_bytes(msg)
                 except Exception as exc:
                     logger.debug("%s [cdp->c]: %s", label, exc)
@@ -509,11 +557,18 @@ async def proxy_cdp_websocket(
 
     except Exception as exc:
         logger.error("%s error: %s", label, exc)
+    finally:
+        if rec is not None:
+            try:
+                await rec.close()
+            except Exception as exc:  # pragma: no cover
+                logger.debug("%s recorder.close: %s", label, exc)
 
 
 async def handle_ws_default(request: web.Request) -> web.WebSocketResponse:
     """WebSocket proxy for default (no-seed) Chrome: /devtools/{type}/{guid}"""
     pool: ChromePool = request.app["pool"]
+    rec_config: RecordingConfig = request.app["recording"]
     path = request.match_info.get("path", "")
 
     cp = await pool.get_or_launch(seed=None)
@@ -522,9 +577,24 @@ async def handle_ws_default(request: web.Request) -> web.WebSocketResponse:
     await ws.prepare(request)
 
     pool.connect("__default__")
+    label = f"CDP default [{path}]"
+    recorder = SessionRecorder.create(
+        rec_config,
+        label=label,
+        metadata={
+            "seed": cp.seed,
+            "seed_key": "__default__",
+            "cdp_port": cp.cdp_port,
+            "pid": cp.process.pid,
+            "timezone": cp.timezone,
+            "locale": cp.locale,
+            "proxy": cp.proxy,
+            "client_ip": request.remote,
+        },
+    )
     try:
         target_url = f"ws://127.0.0.1:{cp.cdp_port}/devtools/{path}"
-        await proxy_cdp_websocket(ws, target_url, f"CDP default [{path}]")
+        await proxy_cdp_websocket(ws, target_url, label, recorder=recorder)
     finally:
         pool.disconnect("__default__")
     return ws
@@ -533,6 +603,7 @@ async def handle_ws_default(request: web.Request) -> web.WebSocketResponse:
 async def handle_ws_seed(request: web.Request) -> web.WebSocketResponse:
     """WebSocket proxy for seed-specific Chrome: /fingerprint/{seed}/devtools/{type}/{guid}"""
     pool: ChromePool = request.app["pool"]
+    rec_config: RecordingConfig = request.app["recording"]
     seed = request.match_info["seed"]
     path = request.match_info.get("path", "")
 
@@ -542,9 +613,24 @@ async def handle_ws_seed(request: web.Request) -> web.WebSocketResponse:
     await ws.prepare(request)
 
     pool.connect(seed)
+    label = f"CDP seed={seed} [{path}]"
+    recorder = SessionRecorder.create(
+        rec_config,
+        label=label,
+        metadata={
+            "seed": cp.seed,
+            "seed_key": seed,
+            "cdp_port": cp.cdp_port,
+            "pid": cp.process.pid,
+            "timezone": cp.timezone,
+            "locale": cp.locale,
+            "proxy": cp.proxy,
+            "client_ip": request.remote,
+        },
+    )
     try:
         target_url = f"ws://127.0.0.1:{cp.cdp_port}/devtools/{path}"
-        await proxy_cdp_websocket(ws, target_url, f"CDP seed={seed} [{path}]")
+        await proxy_cdp_websocket(ws, target_url, label, recorder=recorder)
     finally:
         pool.disconnect(seed)
     return ws
@@ -572,6 +658,12 @@ def parse_cli_args(argv: list[str]) -> tuple[dict, list[str]]:
     extracted into config defaults so they route through build_args()
     (e.g. locale needs both --lang and --fingerprint-locale).
     Query-string params override these defaults per-connection.
+
+    Recording flags:
+        --record-dir=PATH      Enable recording into PATH (one folder per session).
+        --record-cdp=BOOL      Write raw cdp.jsonl transcript (default: true).
+        --record-har=BOOL      Write derived network.har (default: false).
+        --record-max-bytes=N   Soft cap on cdp.jsonl bytes (default: unlimited).
     """
     config: dict = {
         "port": 9222,
@@ -580,6 +672,10 @@ def parse_cli_args(argv: list[str]) -> tuple[dict, list[str]]:
         "default_seed": None,
         "default_locale": None,
         "default_timezone": None,
+        "record_dir": None,
+        "record_cdp": True,
+        "record_har": False,
+        "record_max_bytes": None,
     }
     passthrough = []
     # Flags consumed by cloakserve (not passed to Chrome)
@@ -600,6 +696,18 @@ def parse_cli_args(argv: list[str]) -> tuple[dict, list[str]]:
             passthrough.append(arg)
         elif arg.startswith(consumed_prefixes):
             pass  # Strip these silently
+        # Recording flags
+        elif arg.startswith("--record-dir="):
+            config["record_dir"] = arg.split("=", 1)[1]
+        elif arg.startswith("--record-cdp="):
+            config["record_cdp"] = parse_bool_flag(arg.split("=", 1)[1])
+        elif arg.startswith("--record-har="):
+            config["record_har"] = parse_bool_flag(arg.split("=", 1)[1])
+        elif arg.startswith("--record-max-bytes="):
+            try:
+                config["record_max_bytes"] = int(arg.split("=", 1)[1])
+            except ValueError:
+                logger.warning("Invalid --record-max-bytes value, ignoring: %s", arg)
         # Route through build_args() so companion flags are set correctly
         elif arg.startswith("--fingerprint-locale="):
             config["default_locale"] = arg.split("=", 1)[1]
@@ -634,9 +742,17 @@ def main() -> None:
         default_timezone=config["default_timezone"],
     )
 
+    recording = RecordingConfig.from_cli(
+        record_dir=config["record_dir"],
+        record_cdp=config["record_cdp"],
+        record_har=config["record_har"],
+        max_jsonl_bytes=config["record_max_bytes"],
+    )
+
     app = web.Application()
     app["pool"] = pool
     app["port"] = config["port"]
+    app["recording"] = recording
 
     # Routes
     app.router.add_get("/", handle_root)
@@ -661,6 +777,13 @@ def main() -> None:
         "\"http://localhost:%d?fingerprint=<seed>\")",
         port,
     )
+    if recording.enabled:
+        logger.info(
+            "Recording enabled: dir=%s cdp=%s har=%s",
+            recording.record_dir,
+            recording.record_cdp,
+            recording.record_har,
+        )
 
     web.run_app(app, host="0.0.0.0", port=port, print=None)
 
