@@ -1,0 +1,127 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cloakbrowser-e2e-recording
+  namespace: cloakbrowser
+  labels:
+    app: cloakbrowser-e2e
+    feature: recording
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600  # auto-clean 1h after finish
+  template:
+    metadata:
+      labels:
+        app: cloakbrowser-e2e
+        feature: recording
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr-alexkreidler
+      containers:
+        - name: e2e
+          image: ghcr.io/alexkreidler/cloakbrowser:dev
+          imagePullPolicy: Always
+          # Override entrypoint: start Xvfb (for any headed-mode tests), then
+          # run the unit suite and the raw-CDP e2e, surfacing both exit codes.
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -u
+              echo "==================================================================="
+              echo "[runner] image=$(cat /etc/os-release | grep PRETTY_NAME)"
+              echo "[runner] python=$(python --version 2>&1)"
+              echo "[runner] cloakbrowser=$(python -c 'import cloakbrowser, json; print(cloakbrowser.__version__)')"
+              echo "[runner] chromium binary:"
+              python -c "from cloakbrowser import binary_info; import json; print(json.dumps(binary_info(), indent=2, default=str))"
+              echo "==================================================================="
+
+              # Xvfb already started by /entrypoint.sh, but we override entrypoint
+              # here to inject our own command — start it ourselves.
+              Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+              XVFB_PID=$!
+              export DISPLAY=:99
+              sleep 1
+
+              # Step 1: full pytest suite (excluding "slow" markers).
+              # The image already has cloakbrowser installed system-wide
+              # (built from feat/recording branch); we just need pytest +
+              # the tests/ directory from the cloned source tree.
+              echo
+              echo "===> Step 1: pytest tests/ -v -m 'not slow'"
+              pip install --quiet --no-input pytest pytest-asyncio 2>&1 | tail -3
+              if [ -d /workspace/tests ]; then
+                cd /workspace
+              else
+                echo "[runner] FATAL: /workspace/tests not present (init container failed?)"
+                ls -la /workspace || true
+                exit 1
+              fi
+              pytest tests/ -v -m "not slow" \
+                --ignore=tests/test_human_visual.py \
+                -o cache_dir=/tmp/.pytest_cache
+              PYTEST_RC=$?
+              echo "[runner] pytest exit code: $PYTEST_RC"
+
+              # Step 2: raw-CDP e2e (mimics agent-browser, no Playwright).
+              echo
+              echo "===> Step 2: tests/e2e_recording.py (raw CDP)"
+              mkdir -p /recordings
+              E2E_RECORD_DIR=/recordings E2E_URL=https://example.com/ \
+                python tests/e2e_recording.py
+              E2E_RC=$?
+              echo "[runner] e2e exit code: $E2E_RC"
+
+              echo
+              echo "==================================================================="
+              echo "[runner] /recordings tree:"
+              find /recordings -maxdepth 3 -print 2>/dev/null || true
+              echo "==================================================================="
+
+              kill $XVFB_PID 2>/dev/null || true
+
+              # Surface combined result.
+              if [ $PYTEST_RC -ne 0 ] || [ $E2E_RC -ne 0 ]; then
+                echo "[runner] FAILED  (pytest=$PYTEST_RC, e2e=$E2E_RC)"
+                exit 1
+              fi
+              echo "[runner] ALL GREEN  (pytest=$PYTEST_RC, e2e=$E2E_RC)"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          volumeMounts:
+            - name: recordings
+              mountPath: /recordings
+            - name: workspace
+              mountPath: /workspace
+      # InitContainer clones the branch tarball so we have tests/ available
+      # (the published image only ships cloakbrowser/, not tests/).
+      initContainers:
+        - name: fetch-source
+          image: alpine/git:latest
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              cd /workspace
+              git clone --depth 1 --branch feat/recording \
+                https://github.com/alexkreidler/CloakBrowser.git src
+              mv src/* src/.[!.]* . 2>/dev/null || true
+              rmdir src 2>/dev/null || true
+              ls -la /workspace
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: recordings
+          emptyDir: {}
+        - name: workspace
+          emptyDir: {}
