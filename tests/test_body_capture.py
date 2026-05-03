@@ -146,7 +146,8 @@ class TestBodyCaptureFeed:
         cmd = cmds[0]
         assert cmd["method"] == "Network.getResponseBody"
         assert cmd["params"] == {"requestId": "R1"}
-        assert cmd["id"] >= 9_000_000_000
+        assert cmd["id"] >= 1_000_000_000
+        assert cmd["id"] < 2_147_483_648  # must fit in signed int32 (Chrome CDP limit)
         assert "sessionId" not in cmd  # browser-level session
 
     def test_session_id_round_trips(self, tmp_path):
@@ -167,6 +168,38 @@ class TestBodyCaptureFeed:
         })
         assert len(cmds) == 1
         assert cmds[0]["sessionId"] == "S1"
+
+    def test_injected_ids_fit_in_int32(self, tmp_path):
+        """Chromium's CDP dispatcher uses a signed int32 for message ids.
+
+        IDs >= 2**31 are silently dropped (no reply, no error event). This
+        regression test pins the sentinel ID range so we never reintroduce
+        the bug.
+        """
+        bc = BodyCapture(_cfg(tmp_path))
+        ids: list[int] = []
+        for i in range(50):
+            req_id = f"R{i}"
+            bc.feed_event({
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": req_id,
+                    "response": {"mimeType": "text/html",
+                                 "encodedDataLength": 100, "headers": {}},
+                },
+            })
+            cmds = bc.feed_event({
+                "method": "Network.loadingFinished",
+                "params": {"requestId": req_id, "encodedDataLength": 100},
+            })
+            assert len(cmds) == 1
+            ids.append(cmds[0]["id"])
+        INT32_MAX = 2 ** 31 - 1
+        for msg_id in ids:
+            assert 0 < msg_id <= INT32_MAX, (
+                f"injected id {msg_id} would be silently dropped by "
+                f"Chromium's int32 CDP dispatcher"
+            )
 
     def test_skipped_on_disallowed_mime(self, tmp_path):
         bc = BodyCapture(_cfg(tmp_path))

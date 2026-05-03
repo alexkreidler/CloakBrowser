@@ -49,7 +49,15 @@ logger = logging.getLogger("cloakbrowser.recording.bodycap")
 # Sentinel ID base.  CDP message IDs are typically small positive ints
 # allocated by clients starting from 1; we pick a base far above any
 # realistic client allocation so collisions are impossible in practice.
-_INJECTED_ID_BASE = 9_000_000_000
+#
+# IMPORTANT: Chromium's CDP dispatcher uses a *signed 32-bit int* for the
+# message id field.  IDs >= 2**31 are silently dropped (no reply, no error
+# event).  We pick 1e9 — comfortably above realistic client allocations
+# (clients tend to use small monotonic integers in the low thousands) but
+# well below the 2^31 ceiling so we have headroom for ~10**9 injected
+# commands per session before we'd risk collision.
+_INJECTED_ID_BASE = 1_000_000_000  # 10**9, well below 2**31 = 2_147_483_648
+_INJECTED_ID_MAX = 2_000_000_000   # leave a safety margin under 2**31
 
 
 @dataclass
@@ -204,6 +212,12 @@ class BodyCapture:
             self.metrics.skipped_budget += 1
             return []
         if remaining is not None and encoded_size > remaining:
+            self.metrics.skipped_budget += 1
+            return []
+
+        # Guard against the (extremely unlikely) case of running out of
+        # sentinel ID space.  ~10^9 commands per session is plenty.
+        if self._next_id >= _INJECTED_ID_MAX:
             self.metrics.skipped_budget += 1
             return []
 
